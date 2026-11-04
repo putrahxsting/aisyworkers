@@ -1940,55 +1940,22 @@ jobs:
             echo "::endgroup::"
           }
 
-          upgrade_gradle_to_flutter_minimum() {
-            # Flutter Gradle plugin can report its own minimum supported Gradle version.
-            # Upgrade only when that explicit diagnostic exists; never guess a version.
-            local required wrapper
-            required="$(python3 - "$LOG" <<'PYGR'
-          import re,sys
-          t=open(sys.argv[1],errors='ignore').read()
-          patterns=[r"minimum supported version of\s*([0-9]+(?:\.[0-9]+){1,2})",
-                    r"minimum supported Gradle version is\s*([0-9]+(?:\.[0-9]+){1,2})"]
-          found=[]
-          for p in patterns:
-              found += re.findall(p,t,re.I)
-          print(found[-1] if found else "")
-          PYGR
-          )"
-            [ -n "$required" ] || return 1
-            wrapper="$PRJ/android/gradle/wrapper/gradle-wrapper.properties"
-            [ -f "$wrapper" ] || wrapper="$PRJ/gradle/wrapper/gradle-wrapper.properties"
-            [ -f "$wrapper" ] || { echo "::warning::Gradle wrapper tidak ditemukan; tidak bisa auto-upgrade."; return 1; }
-            python3 - "$wrapper" "$required" <<'PYGR'
-          import re,sys
-          p,required=sys.argv[1:]
-          s=open(p,encoding='utf-8-sig').read()
-          m=re.search(r'(distributionUrl\s*=\s*.*?gradle-)([0-9]+(?:\.[0-9]+){1,2})(-(?:all|bin)\.zip)',s)
-          if not m:
-              raise SystemExit("distributionUrl Gradle tidak dikenali")
-          old=m.group(2)
-          def v(x): return tuple(int(z) for z in x.split('.'))
-          if v(old) < v(required):
-              s=s[:m.start(2)]+required+s[m.end(2):]
-              open(p,'w').write(s)
-              print(f"::notice::Gradle wrapper otomatis dinaikkan {old} -> {required} (syarat Flutter).")
-          else:
-              print(f"::notice::Gradle wrapper {old} sudah memenuhi minimum Flutter {required}.")
-          PYGR
-            }
-
           build_flutter() {
             if flutter_build "flutter build apk ($TYPE, $PERF)" n; then return 0; fi
-            echo "::warning::Build pertama gagal. Memeriksa apakah Flutter meminta minimum Gradle yang lebih baru."
-            if upgrade_gradle_to_flutter_minimum; then
-              cleanup_state
-              (cd "$PRJ" && run "flutter pub get setelah upgrade Gradle" flutter pub get) || return 1
-              if flutter_build "flutter build apk (setelah upgrade Gradle, verbose)" v; then return 0; fi
-            fi
-            echo "::warning::Mengulang sekali dengan state Gradle bersih dan log verbose; versi Flutter tetap mengikuti constraint project."
+            echo "::warning::Build gagal. Mengulang dengan state bersih + log verbose."
             cleanup_state
-            (cd "$PRJ" && flutter clean >/dev/null 2>&1; run "flutter pub get (ulang)" flutter pub get) || return 1
+            (cd "$PRJ" && flutter clean >/dev/null 2>&1; run "flutter pub get (ulang)" flutter pub get) || true
             if flutter_build "flutter build apk (ulang, verbose)" v; then return 0; fi
+            if [ -n "$ALT" ]; then
+              echo "::warning::Mencoba Flutter alternatif $ALT (seangkatan constraint SDK project)."
+              cleanup_state
+              if install_alt_flutter "$ALT"; then
+                (cd "$PRJ" && flutter clean >/dev/null 2>&1; run "flutter pub get (SDK $ALT)" flutter pub get) || true
+                if flutter_build "flutter build apk (Flutter $ALT)" v; then return 0; fi
+              else
+                echo "::warning::Flutter $ALT tidak bisa diunduh."
+              fi
+            fi
             return 1
           }
 
@@ -2167,10 +2134,18 @@ jobs:
       - name: "5a · Pasang Flutter ${{ steps.tc.outputs.flutter_selector || steps.tc.outputs.channel }}"
         id: flutter1
         if: env.ENGINE == 'flutter'
+        continue-on-error: true
         uses: subosito/flutter-action@v2
         with:
           flutter-version: ${{ steps.tc.outputs.flutter_selector }}
           channel: ${{ steps.tc.outputs.channel || 'stable' }}
+          cache: true
+
+      - name: "5b · Pasang Flutter stable (cadangan)"
+        if: env.ENGINE == 'flutter' && steps.flutter1.outcome == 'failure'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
           cache: true
 
       - name: "5c · Siapkan project Flutter (create • pub get • build_runner • plugin)"
