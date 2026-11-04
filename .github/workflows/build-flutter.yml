@@ -21,6 +21,11 @@
 #    SDK/NDK : compileSdk, build-tools, NDK, CMake dibaca dari project + plugin Flutter lalu dipasang
 #    Tambalan: gradlew CRLF, org.gradle.java.home milik PC lain, key.properties hilang, namespace
 #              modul lama, AndroidX, local.properties, APK unsigned → ditandatangani
+#    Penyelaras versi (compat.py, v11):
+#              • Flutter dipilih dari constraint pubspec + kebutuhan SDK tiap dependency (pub.dev), bukan hanya environment.sdk
+#              • Gradle wrapper / AGP / Kotlin otomatis dinaikkan ke syarat minimum Flutter SDK terpasang & syarat AGP
+#              • build gagal → baca pesan error → perbaiki (Gradle/AGP/Kotlin/JDK/compileSdk/minSdk/NDK/CMake/build-tools/
+#                lisensi SDK/memori/lint/R8/namespace/google-services) → ulang; bila perlu ganti versi Flutter
 #  Override opsional di payload: flutterVersion, javaVersion, gradleVersion, ndkVersion,
 #    compileSdk, buildTools, flavor, packageName, versionName
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -154,6 +159,7 @@ jobs:
             plugins    (setelah flutter pub get) baca kebutuhan SDK/NDK dari plugin + default Flutter SDK
           """
           import json, os, re, shutil, sys, urllib.request
+          from concurrent.futures import ThreadPoolExecutor, as_completed
 
           WS = os.environ.get("GITHUB_WORKSPACE", os.getcwd())
           PROJECT = os.path.join(WS, "project")
@@ -297,6 +303,8 @@ jobs:
                   acc["compile"].add(int(m.group(1)))
               for m in re.finditer(r"release\((\d{2})\)", text):
                   acc["compile"].add(int(m.group(1)))
+              for m in re.finditer(r"\bminSdk(?:Version)?\s*(?:=|\(|\s)\s*(\d{2})\b", text):
+                  acc["min_sdk"].add(int(m.group(1)))
               for m in re.finditer(r"buildToolsVersion\s*(?:=|\()?\s*[\"'](\d+(?:\.\d+){1,3})[\"']", text):
                   acc["tools"].add(m.group(1))
               for m in re.finditer(r"ndkVersion\s*(?:=|\()?\s*[\"'](\d+(?:\.\d+){1,3})[\"']", text):
@@ -335,7 +343,7 @@ jobs:
 
           def new_acc():
               return {"compile": set(), "tools": set(), "ndk": set(), "cmake": set(), "jdk_req": set(), "agp": set(),
-                      "kotlin": set(), "gradle_wrap": set(), "native_code": False}
+                      "kotlin": set(), "gradle_wrap": set(), "native_code": False, "min_sdk": set()}
 
 
           def scan_project(root):
@@ -361,6 +369,7 @@ jobs:
               (2, 12): "2.0.x", (2, 13): "2.2.x", (2, 14): "2.5.x", (2, 15): "2.8.x", (2, 16): "2.10.x", (2, 17): "3.0.x",
               (2, 18): "3.3.x", (2, 19): "3.7.x", (3, 0): "3.10.x", (3, 1): "3.13.x", (3, 2): "3.16.x", (3, 3): "3.19.x",
               (3, 4): "3.22.x", (3, 5): "3.24.x", (3, 6): "3.27.x", (3, 7): "3.29.x", (3, 8): "3.32.x",
+              (3, 9): "3.35.x", (3, 10): "3.38.x", (3, 11): "3.41.x", (3, 12): "3.44.x", (3, 13): "3.47.x",
           }
 
 
@@ -386,14 +395,118 @@ jobs:
               return rels
 
 
+          PUB_API = "https://pub.dev/api/packages/"
+          SKIP_PKGS = {"flutter", "flutter_test", "flutter_localizations", "flutter_web_plugins", "integration_test", "flutter_driver"}
+
+
+          def pubspec_deps(text):
+              """name -> constraint versi (paket hosted) dari dependencies & dev_dependencies."""
+              deps, section, indent = {}, None, None
+              for ln in text.splitlines():
+                  if ln.strip() == "" or ln.lstrip().startswith("#"):
+                      continue
+                  if not ln.startswith((" ", "\t")):
+                      m = re.match(r"^(dependencies|dev_dependencies)\s*:\s*(?:#.*)?$", ln)
+                      section, indent = (m.group(1) if m else None), None
+                      continue
+                  if section is None:
+                      continue
+                  m = re.match(r"^([ \t]+)([A-Za-z_][\w\-]*)\s*:\s*(.*?)\s*(?:#.*)?$", ln)
+                  if not m:
+                      continue
+                  if indent is None:
+                      indent = m.group(1)
+                  if m.group(1) != indent:
+                      continue
+                  name, val = m.group(2), m.group(3).strip().strip("'\"")
+                  if name in SKIP_PKGS or not val:
+                      continue
+                  if re.match(r"^(\^|>=|>|<=|<|=|any\b|\d)", val):
+                      deps[name] = val
+              return deps
+
+
+          def _pub_lowest(name, cons):
+              """(dart_min, flutter_min) dari VERSI TERENDAH paket yang memenuhi constraint (batas bawah pasti)."""
+              data = None
+              for _ in range(2):
+                  try:
+                      req = urllib.request.Request(PUB_API + name, headers={"User-Agent": "build-workflow", "Accept": "application/vnd.pub.v2+json"})
+                      data = json.load(urllib.request.urlopen(req, timeout=15))
+                      break
+                  except Exception:  # noqa
+                      continue
+              if not data:
+                  return None
+              best = None
+              for v in data.get("versions", []):
+                  ver = str(v.get("version", ""))
+                  if "-" in ver or v.get("retracted"):
+                      continue
+                  p = vparse(ver)
+                  if p and satisfies(p, cons) and (best is None or p < best[0]):
+                      best = (p, v)
+              if not best:
+                  return None
+              env = (best[1].get("pubspec") or {}).get("environment") or {}
+              return lower_bound(parse_constraint(str(env.get("sdk") or ""))), lower_bound(parse_constraint(str(env.get("flutter") or "")))
+
+
+          def deps_min_sdk(pub_text):
+              """Batas bawah Dart/Flutter yang dibutuhkan dependency pubspec (mis. intl 0.20.3 -> Dart 3.9). Gagal jaringan -> (None, None)."""
+              if os.environ.get("NO_PUB_API"):
+                  return None, None
+              deps = pubspec_deps(pub_text)
+              dmin = fmin = None
+              why = {}
+              try:
+                  with ThreadPoolExecutor(max_workers=8) as ex:
+                      futs = {ex.submit(_pub_lowest, n, parse_constraint(c)): n for n, c in list(deps.items())[:120]}
+                      for fu in as_completed(futs, timeout=90):
+                          r = fu.result()
+                          if not r:
+                              continue
+                          d, f = r
+                          if d and (dmin is None or d > dmin):
+                              dmin, why["dart"] = d, futs[fu]
+                          if f and (fmin is None or f > fmin):
+                              fmin, why["flutter"] = f, futs[fu]
+              except Exception as e:  # noqa
+                  warn(f"Analisis dependency via pub.dev tidak lengkap: {e}")
+              if dmin:
+                  print(f"Dependency membutuhkan Dart >= {vstr(dmin)} (penentu: {why.get('dart')})")
+              if fmin:
+                  print(f"Dependency membutuhkan Flutter >= {vstr(fmin)} (penentu: {why.get('flutter')})")
+              return dmin, fmin
+
+
+          def pick_candidates(rels, dcons, fcons, dmin=None, fmin=None):
+              """Urutan Flutter yang dicoba: seangkatan terendah yang kompatibel (paling cocok dg umur dependency) -> terbaru -> tengah."""
+              ok = [(f, d) for f, d in rels if satisfies(d, dcons) and satisfies(f, fcons)]
+              if not ok:
+                  return []
+              strict = [(f, d) for f, d in ok if (not dmin or d >= dmin) and (not fmin or f >= fmin)]
+              if strict:
+                  ok = strict
+              minors = sorted({d[:2] for _, d in ok})
+              latest = lambda mn: max(f for f, d in ok if d[:2] == mn)  # noqa: E731
+              order = [latest(minors[0]), max(f for f, _ in ok), latest(minors[len(minors) // 2])]
+              seen, res = set(), []
+              for f in order:
+                  if f not in seen:
+                      seen.add(f)
+                      res.append(f)
+              return res
+
+
           def resolve_flutter(project, ovr):
-              """Return (primary, alt, channel, source)"""
+              """Return (primary, [alt...], channel, source)"""
               # 1) override eksplisit
               if ovr:
                   o = str(ovr).strip()
                   if o in ("stable", "beta", "master", "dev"):
-                      return "", "", o, "payload"
-                  return o.lstrip("v"), "", "stable", "payload"
+                      return "", [], o, "payload"
+                  return o.lstrip("v"), [], "stable", "payload"
               # 2) FVM / asdf
               for fn, pat in ((".fvmrc", r'"flutter"\s*:\s*"([^"]+)"'), (os.path.join(".fvm", "fvm_config.json"), r'"flutterSdkVersion"\s*:\s*"([^"]+)"'),
                               (".tool-versions", r"^\s*flutter\s+([\w.\-]+)")):
@@ -401,38 +514,28 @@ jobs:
                   if m:
                       v = m.group(1).split("@")[-1].replace("-stable", "").strip()
                       if v in ("stable", "beta", "master", "dev"):
-                          return "", "", v, fn
+                          return "", [], v, fn
                       if vparse(v):
-                          return v.lstrip("v"), "", "stable", fn
-              # 3) constraint pubspec
+                          return v.lstrip("v"), [], "stable", fn
+              # 3) constraint pubspec + kebutuhan SDK dari dependency
               pub = read(os.path.join(project, "pubspec.yaml"))
               env = pubspec_env(pub)
               dcons, fcons = parse_constraint(env["sdk"]), parse_constraint(env["flutter"])
-              has_lock = os.path.exists(os.path.join(project, "pubspec.lock"))
               if not dcons and not fcons:
-                  return "", "", "stable", "tidak ada constraint -> stable terbaru"
+                  return "", [], "stable", "tidak ada constraint -> stable terbaru"
+              dmin, fmin = deps_min_sdk(pub)
               rels = load_releases()
               if not rels:
-                  low = lower_bound(dcons)
+                  low = max([x for x in (lower_bound(dcons), dmin) if x] or [None]) if (lower_bound(dcons) or dmin) else None
                   alt = FALLBACK_BY_DART.get((low[0], low[1])) if low else None
-                  if alt and low and low[:2] <= (3, 8):
-                      return alt, "", "stable", "tabel cadangan"
-                  return "", "", "stable", "tabel cadangan -> stable terbaru"
-              ok = [(f, d) for f, d in rels if satisfies(d, dcons) and satisfies(f, fcons)]
-              if not ok:
+                  if alt:
+                      return alt, [], "stable", "tabel cadangan"
+                  return "", [], "stable", "tabel cadangan -> stable terbaru"
+              cands = pick_candidates(rels, dcons, fcons, dmin, fmin)
+              if not cands:
                   warn(f"Tidak ada Flutter stable yang cocok dengan sdk '{env['sdk']}' / flutter '{env['flutter']}'; memakai stable terbaru.")
-                  return "", "", "stable", "constraint tidak terpenuhi"
-              newest = max(ok)[0]
-              low = lower_bound(dcons)
-              era = None
-              if low:
-                  same = [f for f, d in ok if d[:2] == low[:2]]
-                  era = max(same) if same else min(f for f, _ in ok)
-              primary, alt = newest, era
-              if has_lock and era:
-                  primary, alt = era, newest  # pubspec.lock = paket terkunci, lebih aman pakai SDK seangkatan
-              alt = alt if alt and alt != primary else None
-              return vstr(primary), (vstr(alt) if alt else ""), "stable", f"constraint sdk '{env['sdk']}'"
+                  return "", [], "stable", "constraint tidak terpenuhi"
+              return vstr(cands[0]), [vstr(c) for c in cands[1:]], "stable", f"sdk '{env['sdk']}'" + (f" + dependency (Dart>={vstr(dmin)})" if dmin else "")
 
 
           # ───────────────────────── JDK & Gradle ─────────────────────────
@@ -606,10 +709,12 @@ jobs:
                   acc["tools"].add(ovr["OVR_BUILD_TOOLS"])
 
               flutter_v = flutter_alt = ""
+              flutter_alts = []
               channel, src = "stable", ""
               if engine == "flutter":
-                  flutter_v, flutter_alt, channel, src = resolve_flutter(PROJECT, ovr["OVR_FLUTTER"])
-                  print(f"Flutter: {flutter_v or channel} (alt: {flutter_alt or '-'}) <- {src}")
+                  flutter_v, flutter_alts, channel, src = resolve_flutter(PROJECT, ovr["OVR_FLUTTER"])
+                  flutter_alt = flutter_alts[0] if flutter_alts else ""
+                  print(f"Flutter: {flutter_v or channel} (alt: {' '.join(flutter_alts) or '-'}) <- {src}")
 
               wrapper = os.path.join(PROJECT, "android" if engine == "flutter" else "", "gradlew")
               if engine == "native":
@@ -636,7 +741,7 @@ jobs:
 
               app_module = find_app_module(PROJECT) if engine == "native" else "app"
               tc = {
-                  "engine": engine, "flutter": flutter_v, "flutter_alt": flutter_alt, "channel": channel, "java": java,
+                  "engine": engine, "flutter": flutter_v, "flutter_alt": flutter_alt, "flutter_alts": flutter_alts, "channel": channel, "java": java,
                   "gradle": gradle_ver, "has_wrapper": has_wrapper, "agp": agp, "kotlin": vmax(acc["kotlin"]),
                   "compile": sorted(acc["compile"]), "tools": sorted(acc["tools"]), "ndk": sorted(acc["ndk"]),
                   "cmake": sorted(acc["cmake"]), "native_code": acc["native_code"], "flavor": flavor,
@@ -649,6 +754,7 @@ jobs:
               print("::endgroup::")
               for k in ("flutter", "flutter_alt", "channel", "java", "gradle", "flavor", "app_module"):
                   out(k, tc[k])
+              out("flutter_alts", " ".join(flutter_alts))
               out("has_wrapper", "true" if has_wrapper else "false")
               out("agp", agp)
               out("gradle_wrapper_version", gradle_wrap)
@@ -665,6 +771,7 @@ jobs:
               acc["ndk"].update(tc.get("ndk", []))
               acc["cmake"].update(tc.get("cmake", []))
               jdk_req = set()
+              plugin_min = set()
               # default Flutter SDK (flutter.compileSdkVersion / flutter.ndkVersion)
               froot = os.environ.get("FLUTTER_ROOT") or ""
               if not froot:
@@ -709,10 +816,12 @@ jobs:
                                   acc["ndk"] |= sub["ndk"]; acc["cmake"] |= sub["cmake"]
                                   if sub["native_code"]: acc["native_code"] = True
                                   jdk_req |= sub["jdk_req"]
+                                  plugin_min |= sub["min_sdk"]
               except Exception as e:  # noqa
                   warn(f"package_config.json tidak terbaca: {e}")
               tc.update({"compile": sorted(acc["compile"]), "tools": sorted(acc["tools"]), "ndk": sorted(acc["ndk"]),
-                         "cmake": sorted(acc["cmake"]), "native_code": acc["native_code"], "plugins_scanned": n_scan})
+                         "cmake": sorted(acc["cmake"]), "native_code": acc["native_code"], "plugins_scanned": n_scan,
+                         "plugin_min_sdk": max(plugin_min) if plugin_min else 0})
               new_java = choose_java(tc.get("gradle_wrapper_version") or "", tc.get("agp") or "", set(tc.get("jdk_req", [])) | jdk_req,
                                      tc.get("flutter") or tc.get("flutter_alt"), os.environ.get("OVR_JAVA", ""))
               if new_java > int(tc.get("java", 0)):
@@ -959,6 +1068,613 @@ jobs:
                   namespace_fix()
               user_gradle()
               print(f"[prepare] selesai: {len(fixes)} perbaikan")
+          __CI_EOF__
+          cat > "$RUNNER_TEMP/ci/compat.py" <<'__CI_EOF__'
+          #!/usr/bin/env python3
+          """compat.py - penyelaras versi toolchain agar project lama/baru bisa dibuild (JDK • Gradle • AGP • Kotlin • SDK • NDK • Flutter).
+
+          Subcommand:
+            reqs                       baca syarat minimum Gradle/AGP/Kotlin/Java dari Flutter SDK terpasang -> _diag/flutter_reqs.json
+                                       (+ naikkan JDK di toolchain.json bila perlu; output `java` untuk setup-java)
+            patch                      penyelarasan PROAKTIF di project: wrapper Gradle, AGP, Kotlin, minSdk plugin, NDK tertinggi
+            heal <log>                 baca log build yang gagal -> terapkan perbaikan REAKTIF (project / JDK / paket SDK / Flutter / flag).
+                                       Menulis $RUNNER_TEMP/heal.sh (HEAL_JAVA, HEAL_SDK, HEAL_FLUTTER, HEAL_FLAGS). Exit 0 = ada perubahan baru.
+            next-flutter <log> <v>...  pilih versi Flutter berikutnya setelah `flutter pub get` gagal (v... = yang sudah dicoba)
+
+          Semua langkah bersifat best-effort: tidak pernah menghentikan workflow sendiri.
+          """
+          import json, os, re, subprocess, sys, urllib.request
+
+          sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+          import detect as D  # noqa: E402  (skrip bersaudara di folder yang sama)
+
+          WS = os.environ.get("GITHUB_WORKSPACE", os.getcwd())
+          PROJECT = os.path.join(WS, "project")
+          DIAG = os.path.join(WS, "_diag")
+          TC_JSON = os.path.join(DIAG, "toolchain.json")
+          REQS_JSON = os.path.join(DIAG, "flutter_reqs.json")
+          STATE_JSON = os.path.join(DIAG, "heal-state.json")
+          ENGINE = os.environ.get("ENGINE", "native")
+          TMP = os.environ.get("RUNNER_TEMP", "/tmp")
+          HOME = os.path.expanduser("~")
+          GRADLE_ROOT = os.path.join(PROJECT, "android") if ENGINE == "flutter" else PROJECT
+          vparse, vstr = D.vparse, D.vstr
+
+
+          def note(msg):
+              print(f"::notice::[compat] {msg}")
+
+
+          def warn(msg):
+              print(f"::warning::[compat] {msg}")
+
+
+          def rd(p):
+              try:
+                  with open(p, "r", encoding="utf-8-sig", errors="replace") as f:
+                      return f.read()
+              except OSError:
+                  return ""
+
+
+          def wr(p, s):
+              os.makedirs(os.path.dirname(p), exist_ok=True)
+              with open(p, "w", encoding="utf-8", newline="\n") as f:
+                  f.write(s)
+
+
+          def jload(p, default):
+              try:
+                  with open(p, encoding="utf-8") as f:
+                      return json.load(f)
+              except Exception:  # noqa
+                  return default
+
+
+          def jsave(p, obj):
+              os.makedirs(os.path.dirname(p), exist_ok=True)
+              with open(p, "w", encoding="utf-8") as f:
+                  json.dump(obj, f, indent=2)
+
+
+          def lt(a, b):
+              pa, pb = vparse(a), vparse(b)
+              return bool(pa and pb and pa < pb)
+
+
+          def vmax2(*vals):
+              vals = [v for v in vals if v and vparse(v)]
+              return max(vals, key=vparse) if vals else ""
+
+
+          def tc_load():
+              return jload(TC_JSON, {})
+
+
+          # ───────────────────────── berkas gradle project ─────────────────────────
+          def gradle_text_files():
+              return [p for p in D.walk_files(GRADLE_ROOT, exts=(".gradle", ".gradle.kts", ".toml"))]
+
+
+          def app_gradle_files():
+              tc = tc_load()
+              if ENGINE == "flutter":
+                  mods = [os.path.join(GRADLE_ROOT, "app")]
+              else:
+                  am = tc.get("app_module") or ""
+                  mods = [os.path.join(GRADLE_ROOT, *am.split(":"))] if am else [GRADLE_ROOT]
+              res = []
+              for m in mods:
+                  for fn in ("build.gradle", "build.gradle.kts"):
+                      p = os.path.join(m, fn)
+                      if os.path.exists(p):
+                          res.append(p)
+              return res
+
+
+          def sub_versions(text, regexes, target):
+              """Ganti versi < target dengan target. Return (teks_baru, [versi_lama])."""
+              olds = []
+
+              def mk(rx):
+                  def rep(m):
+                      old = m.group(2)
+                      if lt(old, target):
+                          olds.append(old)
+                          return m.group(1) + target + m.group(3)
+                      return m.group(0)
+                  return rep
+
+              for rx in regexes:
+                  text = rx.sub(mk(rx), text)
+              return text, olds
+
+
+          V = r"(\d+\.\d+(?:\.\d+)?(?:-[\w.]+)?)"
+          AGP_RES = [
+              re.compile(r"""(\bid\s*\(?\s*["']com\.android\.[\w\-]+["']\s*\)?\s*version\s*\(?\s*["'])""" + V + r"""(["'])"""),
+              re.compile(r"""(com\.android\.tools\.build:gradle:)""" + V + r"""()"""),
+              re.compile(r"""(^\s*(?:agp|androidGradlePlugin|android-gradle-plugin|android_gradle_plugin)\s*=\s*["'])""" + V + r"""(["'])""", re.M),
+          ]
+          KGP_RES = [
+              re.compile(r"""(\bid\s*\(?\s*["'](?:org\.jetbrains\.kotlin\.(?:android|jvm)|kotlin-android)["']\s*\)?\s*version\s*\(?\s*["'])""" + V + r"""(["'])"""),
+              re.compile(r"""(org\.jetbrains\.kotlin:kotlin-gradle-plugin:)""" + V + r"""()"""),
+              re.compile(r"""(^\s*(?:ext\.)?kotlin_version\s*=\s*["'])""" + V + r"""(["'])""", re.M),
+              re.compile(r"""(^\s*kotlin\s*=\s*["'])""" + V + r"""(["'])""", re.M),
+          ]
+
+
+          def bump_plugin(regexes, target, label):
+              done = False
+              for p in gradle_text_files():
+                  t = rd(p)
+                  nt, olds = sub_versions(t, regexes, target)
+                  if olds:
+                      wr(p, nt)
+                      note(f"{label} {', '.join(sorted(set(olds)))} -> {target} di {os.path.relpath(p, PROJECT)}")
+                      done = True
+              return done
+
+
+          def bump_agp(target):
+              return bump_plugin(AGP_RES, target, "AGP")
+
+
+          def bump_kgp(target):
+              return bump_plugin(KGP_RES, target, "Kotlin")
+
+
+          # ───────────────────────── Gradle wrapper ─────────────────────────
+          def norm_gradle(v):
+              t = vparse(v) or (8, 0, 0)
+              if t[0] >= 9:
+                  return f"{t[0]}.{t[1]}.{t[2]}"
+              return f"{t[0]}.{t[1]}" + (f".{t[2]}" if t[2] else "")
+
+
+          def gradle_exists(v):
+              if os.environ.get("NO_NET"):
+                  return None
+              try:
+                  req = urllib.request.Request(f"https://services.gradle.org/distributions/gradle-{v}-bin.zip", method="HEAD", headers={"User-Agent": "build-workflow"})
+                  return urllib.request.urlopen(req, timeout=12).status < 400
+              except Exception as e:  # noqa
+                  return False if getattr(e, "code", 0) == 404 else None
+
+
+          def bump_gradle(target, why=""):
+              wp = os.path.join(GRADLE_ROOT, "gradle", "wrapper", "gradle-wrapper.properties")
+              txt = rd(wp)
+              if not txt:
+                  return False
+              m = re.search(r"distributionUrl\s*=\s*(.+)", txt)
+              cur = re.search(r"gradle-(\d+(?:\.\d+){1,2})(?:-rc-\d+)?-(bin|all)\.zip", m.group(1)) if m else None
+              if not cur or not lt(cur.group(1), target):
+                  return False
+              tgt = norm_gradle(target)
+              if gradle_exists(tgt) is False:  # beberapa versi resmi memakai penulisan lain (8.14 vs 8.14.0)
+                  alt = tgt[:-2] if tgt.endswith(".0") else tgt + ".0"
+                  if gradle_exists(alt):
+                      tgt = alt
+              url = f"https\\://services.gradle.org/distributions/gradle-{tgt}-{cur.group(2)}.zip"
+              txt = re.sub(r"(distributionUrl\s*=\s*).+", lambda mm: mm.group(1) + url, txt, count=1)
+              txt = re.sub(r"^\s*distributionSha256Sum\s*=.*\n?", "", txt, flags=re.M)
+              wr(wp, txt)
+              note(f"Gradle wrapper {cur.group(1)} -> {tgt}" + (f" ({why})" if why else ""))
+              return True
+
+
+          def project_agp():
+              acc = D.scan_project(PROJECT)
+              return D.vmax(acc["agp"]), D.vmax(acc["kotlin"])
+
+
+          def ensure_gradle(reqs=None, why="syarat AGP/Flutter"):
+              agp, _ = project_agp()
+              need = vmax2((reqs or {}).get("gradle_min", ""), D.gradle_for_agp(agp) if agp else "")
+              return bump_gradle(need, why) if need else False
+
+
+          # ───────────────────────── SDK / minSdk / NDK di app module ─────────────────────────
+          RE_COMPILE = re.compile(r"(\bcompileSdk(?:Version)?\s*=?\s*)(flutter\.compileSdk(?:Version)?|(\d+))")
+          RE_MIN = re.compile(r"(\bminSdk(?:Version)?\s*=?\s*)(flutter\.minSdk(?:Version)?|(\d+))")
+          RE_NDK_FLUTTER = re.compile(r"(\bndkVersion\s*=?\s*)flutter\.ndkVersion")
+          RE_NDK_LIT = re.compile(r"""(\bndkVersion\s*=?\s*["'])(\d+(?:\.\d+){1,3})(["'])""")
+
+
+          def bump_compile(n):
+              done = False
+              for p in app_gradle_files():
+                  t = rd(p)
+                  nt = RE_COMPILE.sub(lambda m: m.group(0) if (m.group(3) and int(m.group(3)) >= n) else m.group(1) + str(n), t)
+                  if nt != t:
+                      wr(p, nt)
+                      note(f"compileSdk -> {n} di {os.path.relpath(p, PROJECT)}")
+                      done = True
+              return done
+
+
+          def bump_minsdk(n, flutter_default=0):
+              done = False
+              for p in app_gradle_files():
+                  t = rd(p)
+
+                  def rep(m):
+                      if m.group(3):
+                          return m.group(0) if int(m.group(3)) >= n else m.group(1) + str(n)
+                      return m.group(0) if flutter_default >= n else m.group(1) + str(n)  # flutter.minSdkVersion
+
+                  nt = RE_MIN.sub(rep, t)
+                  if nt != t:
+                      wr(p, nt)
+                      note(f"minSdk -> {n} di {os.path.relpath(p, PROJECT)} (dibutuhkan plugin/library)")
+                      done = True
+              return done
+
+
+          def set_ndk(version):
+              done = False
+              for p in app_gradle_files():
+                  t = rd(p)
+                  nt = RE_NDK_FLUTTER.sub(lambda m: m.group(1) + f'"{version}"', t)
+                  nt = RE_NDK_LIT.sub(lambda m: m.group(0) if not lt(m.group(2), version) else m.group(1) + version + m.group(3), nt)
+                  if nt != t:
+                      wr(p, nt)
+                      note(f"ndkVersion -> {version} di {os.path.relpath(p, PROJECT)}")
+                      done = True
+              return done
+
+
+          # ───────────────────────── Flutter SDK ─────────────────────────
+          def flutter_root():
+              fr = os.environ.get("FLUTTER_ROOT", "")
+              if not fr:
+                  import shutil
+                  fb = shutil.which("flutter")
+                  fr = os.path.dirname(os.path.dirname(os.path.realpath(fb))) if fb else ""
+              return fr
+
+
+          def flutter_current():
+              try:
+                  out = subprocess.run(["flutter", "--version"], capture_output=True, text=True, timeout=120).stdout
+                  m = re.search(r"Flutter\s+(\d+\.\d+\.\d+)", out)
+                  return m.group(1) if m else ""
+              except Exception:  # noqa
+                  return ""
+
+
+          def parse_kt_version(rhs):
+              m = re.search(r"Version\(\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*(\d+))?\s*\)", rhs)
+              if m:
+                  return f"{m.group(1)}.{m.group(2)}.{m.group(3) or 0}"
+              m = re.search(r"VERSION_(\d+)(?:_(\d+))?", rhs)
+              if m:
+                  return str(int(m.group(2)) if m.group(1) == "1" and m.group(2) else int(m.group(1)))
+              return ""
+
+
+          def cmd_reqs():
+              froot = flutter_root()
+              reqs = {"flutter": flutter_current()}
+              gdir = os.path.join(froot, "packages", "flutter_tools", "gradle", "src", "main")
+              if froot and os.path.isdir(gdir):
+                  for dp, _, fns in os.walk(gdir):
+                      for fn in fns:
+                          t = rd(os.path.join(dp, fn)) if fn.endswith((".kt", ".groovy", ".gradle")) else ""
+                          if not t:
+                              continue
+                          if fn == "DependencyVersionChecker.kt" or "DependencyVersionChecker" in t[:4000]:
+                              for m in re.finditer(r"val\s+(error|warn)(Gradle|AGP|KGP|Java)Version\b[^=\n]*=\s*([^\n]+)", t):
+                                  v = parse_kt_version(m.group(3))
+                                  if v and m.group(1) == "error":
+                                      reqs[{"Gradle": "gradle_min", "AGP": "agp_min", "KGP": "kgp_min", "Java": "java_min"}[m.group(2)]] = v
+                          m = re.search(r"\bminSdkVersion\s*(?::\s*Int)?\s*=\s*(\d+)", t)
+                          if m and "FlutterExtension" in (fn + t[:3000]):
+                              reqs["flutter_min_sdk"] = int(m.group(1))
+              jsave(REQS_JSON, reqs)
+              print(f"Syarat minimum dari Flutter SDK {reqs.get('flutter') or '?'}: " + json.dumps({k: v for k, v in reqs.items() if k != 'flutter'}))
+              tc = tc_load()
+              if not tc:
+                  return
+              agp = vmax2(tc.get("agp", ""), reqs.get("agp_min", ""))
+              gr = vmax2(tc.get("gradle_wrapper_version", ""), reqs.get("gradle_min", ""), D.gradle_for_agp(agp) if agp else "")
+              need = D.choose_java(gr, agp, set(tc.get("jdk_req", [])), tc.get("flutter") or tc.get("flutter_alt"), os.environ.get("OVR_JAVA", ""))
+              if reqs.get("java_min") and str(reqs["java_min"]).isdigit():
+                  need = max(need, D.snap_jdk(int(reqs["java_min"])))
+              if need > int(tc.get("java", 0) or 0):
+                  warn(f"Flutter/AGP/Gradle yang dipakai butuh JDK {need} (sebelumnya {tc.get('java')}).")
+                  tc["java"] = need
+                  jsave(TC_JSON, tc)
+                  D.out("java", need)
+
+
+          def cmd_patch():
+              reqs = jload(REQS_JSON, {})
+              tc = tc_load()
+              if not os.path.isdir(GRADLE_ROOT):
+                  return
+              agp, kgp = project_agp()
+              if reqs.get("agp_min") and agp and lt(agp, reqs["agp_min"]):
+                  bump_agp(reqs["agp_min"])
+              if reqs.get("kgp_min") and kgp and lt(kgp, reqs["kgp_min"]):
+                  bump_kgp(reqs["kgp_min"])
+              ensure_gradle(reqs)
+              pm = int(tc.get("plugin_min_sdk") or 0)
+              if pm:
+                  bump_minsdk(pm, int(reqs.get("flutter_min_sdk") or 21))
+              ndks = tc.get("ndk") or []
+              if len(ndks) > 1 and ENGINE == "flutter":
+                  top = D.vmax(ndks)
+                  if top:
+                      set_ndk(top)  # plugin yang meminta NDK berbeda -> pakai yang tertinggi (kompatibel mundur)
+
+
+          # ───────────────────────── heal reaktif ─────────────────────────
+          ANSI = re.compile(r"\x1b\[[0-9;]*m")
+          R_FLUTTER_MIN = re.compile(r"Your project's ([A-Za-z ]+?)(?: version)?\s*\([^)]*\)\s+is lower than Flutter's minimum supported version of\s+(?:[A-Za-z ]*?)(\d+(?:\.\d+){0,2})")
+          R_AGP_GRADLE = [re.compile(r"Minimum supported Gradle version is (\d+(?:\.\d+)+)"),
+                          re.compile(r"requires Gradle (?:version )?(\d+\.\d+(?:\.\d+)?) or (?:newer|higher)", re.I)]
+          R_AGP_DEP = re.compile(r"requires\s+Android\s+Gradle\s+plugin\s+(\d+\.\d+(?:\.\d+)?)\s+or\s+higher")
+          R_JAVA_N = [re.compile(r"requires Java (\d+) to run"), re.compile(r"requires at least JVM runtime version (\d+)"),
+                      re.compile(r"Java Runtime \(class file version (\d+)\.\d\)")]
+          R_JAVA_DOWN = re.compile(r"Unsupported class file major version \d+|JdkImageTransform|jlink|Unsupported Java\. Your build is currently configured to use Java")
+          R_BT = re.compile(r"Failed to find Build Tools revision (\d[\w.\-]*)")
+          R_TARGET = re.compile(r"Failed to find target with hash string 'android-([\w.\-]+)'")
+          R_LICENSE = re.compile(r"Failed to install the following Android SDK packages as some licen[cs]es have not been accepted\.\s*((?:[ \t]+[\w\-]+;[^\n]*\n?)+)")
+          R_NDK_VER = re.compile(r"No version of NDK matched the requested version (\d[\w.\-]*)")
+          R_NDK_BAD = re.compile(r"NDK at (\S+?) did not have a source\.properties")
+          R_NDK_ANY = re.compile(r"\[CXX1100\]|NDK is not installed|NDK not configured|Could not find the Android NDK|NDK.*(?:not found|missing)", re.I)
+          R_CMAKE = re.compile(r"CMake '(\d[\d.]*)' was not found")
+          R_COMPILE = re.compile(r"requires\s+libraries\s+and\s+applications\s+that\s+depend\s+on\s+it\s+to\s+compile\s+against\s+version\s+(\d+)\s+or\s+later")
+          R_MINSDK = re.compile(r"minSdkVersion\s+(\d+)\s+cannot be smaller than version\s+(\d+)\s+declared in library")
+          R_KMETA = re.compile(r"binary version of its metadata is (\d+)\.(\d+)\.\d+, expected version is")
+          R_OOM = re.compile(r"OutOfMemoryError|GC overhead limit|Java heap space|Metaspace|Daemon will be stopped at the end of the build after running out of JVM memory")
+          R_LINT = re.compile(r"lintVital\w*|Lint found fatal errors")
+          R_R8 = re.compile(r"Missing classes detected while running R8|minify\w*WithR8|R8: |ProGuard")
+          R_NS = re.compile(r"Namespace not specified\.[^\n]*?build file:\s*(\S+)")
+          R_GSVC = re.compile(r"File google-services\.json is missing")
+          R_PUB_DART = re.compile(r"requires SDK version (?:\^|>=)\s*(\d+\.\d+(?:\.\d+)?)")
+          R_PUB_FLUTTER = re.compile(r"requires Flutter SDK version (?:\^|>=)\s*(\d+\.\d+(?:\.\d+)?)")
+          R_NDK_WARN = re.compile(r"Fix this issue by using the highest Android NDK version[\s\S]{0,400}?ndkVersion\s*=?\s*\"(\d[\d.]+)\"")
+
+
+          def java_major():
+              try:
+                  out = subprocess.run(["java", "-version"], capture_output=True, text=True, timeout=30)
+                  m = re.search(r'version "(\d+)(?:\.(\d+))?', out.stderr + out.stdout)
+                  if m:
+                      return int(m.group(2)) if m.group(1) == "1" and m.group(2) else int(m.group(1))
+              except Exception:  # noqa
+                  pass
+              return int(tc_load().get("java") or 17)
+
+
+          def java_available(n):
+              return bool(os.environ.get(f"JAVA_HOME_{n}_X64"))
+
+
+          def pick_flutter(dneed, fneed, tried):
+              """Flutter stable terendah (patch terbaru dari minor Dart terendah) yang memenuhi pubspec + kebutuhan baru."""
+              pub = D.read(os.path.join(PROJECT, "pubspec.yaml"))
+              env = D.pubspec_env(pub)
+              dcons, fcons = D.parse_constraint(env["sdk"]), D.parse_constraint(env["flutter"])
+              rels = D.load_releases()
+              ok = [(f, d) for f, d in rels
+                    if D.satisfies(d, dcons) and D.satisfies(f, fcons) and (not dneed or d >= dneed) and (not fneed or f >= fneed) and vstr(f) not in tried]
+              if not ok:
+                  return ""
+              low = min(d[:2] for _, d in ok)
+              return vstr(max(f for f, d in ok if d[:2] == low))
+
+
+          def fix_namespace(path):
+              path = path.strip().rstrip(".,")
+              t = rd(path)
+              if not t or re.search(r"\bnamespace\b", t):
+                  return False
+              mf = rd(os.path.join(os.path.dirname(path), "src", "main", "AndroidManifest.xml"))
+              m = re.search(r'package\s*=\s*"([\w.]+)"', mf)
+              ns = m.group(1) if m else "ci.plugin." + re.sub(r"\W", "_", os.path.basename(os.path.dirname(os.path.dirname(path))) or "mod")
+              kts = path.endswith(".kts")
+              nt = re.sub(r"(\bandroid\s*\{)", lambda mm: mm.group(1) + "\n    namespace" + (f' = "{ns}"' if kts else f' "{ns}"'), t, count=1)
+              if nt != t:
+                  wr(path, nt)
+                  note(f"namespace '{ns}' ditambahkan ke {path}")
+                  return True
+              return False
+
+
+          LINT_INIT = """// Dipasang CI saat lint menggagalkan build release
+          allprojects { afterEvaluate { p ->
+              def a = p.extensions.findByName('android')
+              if (a != null) { try { a.lint.checkReleaseBuilds = false; a.lint.abortOnError = false; a.lint.checkDependencies = false } catch (Throwable t) {} }
+          } }
+          """
+
+
+          def dummy_google_services():
+              pkg = ""
+              for p in app_gradle_files():
+                  m = re.search(r"""\b(?:applicationId|namespace)\s*=?\s*["']([\w.]+)["']""", rd(p))
+                  if m:
+                      pkg = m.group(1)
+                      break
+              pkg = pkg or "com.example.app"
+              dst = os.path.join(GRADLE_ROOT, "app", "google-services.json") if ENGINE == "flutter" else os.path.join(GRADLE_ROOT, "google-services.json")
+              if os.path.exists(dst):
+                  return False
+              cfg = {"project_info": {"project_number": "000000000000", "project_id": "ci-placeholder", "storage_bucket": "ci-placeholder.appspot.com"},
+                     "client": [{"client_info": {"mobilesdk_app_id": "1:000000000000:android:0000000000000000", "android_client_info": {"package_name": pkg}},
+                                 "oauth_client": [], "api_key": [{"current_key": "AIzaSyCI000000000000000000000000000000"}],
+                                 "services": {"appinvite_service": {"other_platform_oauth_client": []}}}], "configuration_version": "1"}
+              jsave(dst, cfg)
+              print(f"::warning::[compat] google-services.json tidak ada di project -> dibuat PLACEHOLDER (paket {pkg}) supaya build lolos. "
+                    "Fitur Firebase (push, auth, dll.) TIDAK akan berfungsi sampai kamu menyertakan file asli dari Firebase Console.")
+              return True
+
+
+          def cmd_heal(logpath):
+              raw = ""
+              try:
+                  with open(logpath, "rb") as f:
+                      f.seek(0, 2)
+                      f.seek(max(0, f.tell() - 600_000))
+                      raw = f.read().decode("utf-8", errors="replace")
+              except OSError:
+                  pass
+              log = ANSI.sub("", raw).replace("\r", "")
+              state = set(jload(STATE_JSON, []))
+              tc = tc_load()
+              reqs = jload(REQS_JSON, {})
+              env = {"HEAL_JAVA": "", "HEAL_SDK": [], "HEAL_FLUTTER": "", "HEAL_FLAGS": []}
+              changed = []
+
+              def once(key):
+                  if key in state:
+                      return False
+                  state.add(key)
+                  return True
+
+              def done(msg):
+                  changed.append(msg)
+                  print(f"::notice::[heal] {msg}")
+
+              # 1) syarat minimum Flutter (Gradle / AGP / Kotlin / Java)
+              for m in R_FLUTTER_MIN.finditer(log):
+                  what, ver = m.group(1).lower(), m.group(2)
+                  if "gradle plugin" in what or what.strip() == "agp":
+                      if once(f"agp:{ver}") and bump_agp(ver):
+                          ensure_gradle(reqs, "AGP baru"); done(f"AGP dinaikkan ke {ver} (syarat Flutter)")
+                  elif "gradle" in what:
+                      if once(f"gradle:{ver}") and bump_gradle(ver, "syarat minimum Flutter"):
+                          done(f"Gradle wrapper dinaikkan ke {norm_gradle(ver)} (syarat Flutter)")
+                  elif "kotlin" in what:
+                      if once(f"kgp:{ver}") and bump_kgp(ver):
+                          done(f"Kotlin dinaikkan ke {ver} (syarat Flutter)")
+                  elif "java" in what and ver.isdigit():
+                      n = D.snap_jdk(int(ver))
+                      if once(f"java:{n}") and java_available(n) and java_major() != n:
+                          env["HEAL_JAVA"] = str(n); done(f"JDK diganti ke {n} (syarat Flutter)")
+              # 2) AGP butuh Gradle lebih baru / dependency butuh AGP lebih baru
+              for rx in R_AGP_GRADLE:
+                  for m in rx.finditer(log):
+                      if once(f"gradle:{m.group(1)}") and bump_gradle(m.group(1), "syarat AGP"):
+                          done(f"Gradle wrapper dinaikkan ke {norm_gradle(m.group(1))} (syarat AGP)")
+              for m in R_AGP_DEP.finditer(log):
+                  if once(f"agp:{m.group(1)}") and bump_agp(m.group(1)):
+                      ensure_gradle(reqs, "AGP baru"); done(f"AGP dinaikkan ke {m.group(1)} (syarat dependency)")
+              # 3) JDK
+              want = 0
+              for rx in R_JAVA_N:
+                  for m in rx.finditer(log):
+                      n = int(m.group(1))
+                      want = max(want, n - 44 if n >= 52 else n)  # class file version 65 -> Java 21
+              cur = java_major()
+              if want and D.snap_jdk(want) != cur and once(f"java:{D.snap_jdk(want)}") and java_available(D.snap_jdk(want)):
+                  env["HEAL_JAVA"] = str(D.snap_jdk(want)); done(f"JDK diganti ke {env['HEAL_JAVA']} (dibutuhkan build)")
+              elif not env["HEAL_JAVA"] and R_JAVA_DOWN.search(log) and cur > 17 and once("java:17") and java_available(17):
+                  env["HEAL_JAVA"] = "17"; done(f"JDK {cur} tidak cocok dengan toolchain (jlink/class file) -> pakai JDK 17")
+              # 4) paket Android SDK / NDK / CMake
+              pk = []
+              for m in R_BT.finditer(log): pk.append(f"build-tools;{m.group(1)}")
+              for m in R_TARGET.finditer(log): pk.append(f"platforms;android-{m.group(1)}")
+              for m in R_LICENSE.finditer(log):
+                  pk += re.findall(r"^[ \t]+([\w\-]+;\S+)", m.group(1), re.M)
+              for m in R_NDK_VER.finditer(log): pk.append(f"ndk;{m.group(1)}")
+              for m in R_NDK_BAD.finditer(log):
+                  d = m.group(1)
+                  if os.path.isdir(d) and once(f"rmndk:{d}"):
+                      import shutil
+                      shutil.rmtree(d, ignore_errors=True)
+                      pk.append(f"ndk;{os.path.basename(d.rstrip('/'))}")
+              if not any(p.startswith("ndk;") for p in pk) and R_NDK_ANY.search(log):
+                  pk += [f"ndk;{v}" for v in (tc.get("ndk") or [])]
+              for m in R_CMAKE.finditer(log): pk.append(f"cmake;{m.group(1)}")
+              # 5) compileSdk / minSdk / Kotlin metadata / NDK tertinggi
+              cs = [int(m.group(1)) for m in R_COMPILE.finditer(log)]
+              if cs and once(f"compile:{max(cs)}") and bump_compile(max(cs)):
+                  pk.append(f"platforms;android-{max(cs)}"); done(f"compileSdk dinaikkan ke {max(cs)} (syarat dependency)")
+              ms = [int(m.group(2)) for m in R_MINSDK.finditer(log)]
+              if ms and once(f"minsdk:{max(ms)}") and bump_minsdk(max(ms), 0):
+                  done(f"minSdk dinaikkan ke {max(ms)} (syarat library)")
+              for m in R_KMETA.finditer(log):
+                  v = f"{m.group(1)}.{m.group(2)}.0"
+                  if once(f"kgp:{v}") and bump_kgp(v):
+                      done(f"Kotlin dinaikkan ke {v} (metadata library lebih baru)")
+              for m in R_NDK_WARN.finditer(log):
+                  if once(f"ndk:{m.group(1)}") and set_ndk(m.group(1)):
+                      pk.append(f"ndk;{m.group(1)}"); done(f"ndkVersion diseragamkan ke {m.group(1)}")
+              pk = [p for p in dict.fromkeys(pk) if p and once(f"sdk:{p}")]
+              if pk:
+                  env["HEAL_SDK"] = pk; done("memasang paket SDK: " + ", ".join(pk))
+              # 6) memori / lint / R8 / namespace / google-services
+              if R_OOM.search(log) and once("oom"):
+                  for gp in {os.path.join(GRADLE_ROOT, "gradle.properties")}:
+                      t = rd(gp)
+                      line = "org.gradle.jvmargs=-Xmx6g -XX:MaxMetaspaceSize=2g -XX:+UseParallelGC -Dfile.encoding=UTF-8"
+                      t = re.sub(r"^\s*org\.gradle\.jvmargs\s*=.*$", line, t, flags=re.M) if re.search(r"^\s*org\.gradle\.jvmargs\s*=", t, re.M) else t.rstrip("\n") + "\n" + line + "\n"
+                      wr(gp, t)
+                  done("memori Gradle dinaikkan (-Xmx6g)")
+              if R_LINT.search(log) and once("lint"):
+                  wr(os.path.join(os.environ.get("GRADLE_USER_HOME") or os.path.join(HOME, ".gradle"), "init.d", "ci-lint.gradle"), LINT_INIT)
+                  done("lint release dimatikan (init script)")
+              if R_R8.search(log) and once("r8") and ENGINE == "flutter":
+                  env["HEAL_FLAGS"].append("--no-shrink"); done("R8/ProGuard menggagalkan build -> build tanpa shrink (--no-shrink)")
+              for m in R_NS.finditer(log):
+                  if once(f"ns:{m.group(1)}") and fix_namespace(m.group(1)):
+                      done("namespace modul ditambahkan")
+              if R_GSVC.search(log) and once("gsvc") and dummy_google_services():
+                  done("google-services.json placeholder dibuat")
+              # 7) pub: SDK Dart/Flutter terlalu rendah
+              dn = [D.vparse(m.group(1)) for m in R_PUB_DART.finditer(log)]
+              fn = [D.vparse(m.group(1)) for m in R_PUB_FLUTTER.finditer(log)]
+              if (dn or fn) and ENGINE == "flutter":
+                  tried = {flutter_current()} | {k.split(":", 1)[1] for k in state if k.startswith("flutter:")}
+                  v = pick_flutter(max(dn) if dn else None, max(fn) if fn else None, tried)
+                  if v and once(f"flutter:{v}"):
+                      env["HEAL_FLUTTER"] = v; done(f"Flutter {v} dipilih (dependency butuh Dart>={vstr(max(dn)) if dn else '-'})")
+
+              jsave(STATE_JSON, sorted(state))
+              lines = [f"HEAL_JAVA='{env['HEAL_JAVA']}'", f"HEAL_SDK='{' '.join(env['HEAL_SDK'])}'",
+                       f"HEAL_FLUTTER='{env['HEAL_FLUTTER']}'", f"HEAL_FLAGS='{' '.join(env['HEAL_FLAGS'])}'"]
+              wr(os.path.join(TMP, "heal.sh"), "\n".join(lines) + "\n")
+              print(f"[heal] {len(changed)} perbaikan baru" + ("" if changed else " (tidak ada pola yang dikenali / sudah pernah dicoba)"))
+              sys.exit(0 if changed else 1)
+
+
+          def cmd_next_flutter(logpath, tried):
+              log = ANSI.sub("", rd(logpath))
+              dn = [D.vparse(m.group(1)) for m in R_PUB_DART.finditer(log)]
+              fn = [D.vparse(m.group(1)) for m in R_PUB_FLUTTER.finditer(log)]
+              tried = set(tried)
+              v = pick_flutter(max(dn) if dn else None, max(fn) if fn else None, tried) if (dn or fn) else ""
+              if not v:
+                  for a in tc_load().get("flutter_alts") or []:
+                      if a not in tried:
+                          v = a
+                          break
+              print(v)
+
+
+          if __name__ == "__main__":
+              cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+              try:
+                  if cmd == "reqs":
+                      cmd_reqs()
+                  elif cmd == "patch":
+                      cmd_patch()
+                  elif cmd == "heal":
+                      cmd_heal(sys.argv[2])
+                  elif cmd == "next-flutter":
+                      cmd_next_flutter(sys.argv[2], sys.argv[3:])
+                  else:
+                      print(f"subcommand tidak dikenal: {cmd}")
+              except SystemExit:
+                  raise
+              except Exception as e:  # noqa  (best-effort: jangan pernah menggagalkan workflow)
+                  print(f"::warning::[compat] {cmd} dilewati karena error internal: {type(e).__name__}: {e}")
+                  sys.exit(1 if cmd == "heal" else 0)
           __CI_EOF__
 
       - name: "1b · Skrip bantu: Web2APK & analisis error"
@@ -1655,8 +2371,11 @@ jobs:
               re.compile(r"Namespace not specified|Unsupported class file|Minimum supported Gradle|SDK location not found|Failed to install the following|Plugin \[id: .*\] was not found", re.I),
               re.compile(r"Because .* (depends on|requires)|version solving failed", re.I),
               re.compile(r"No space left on device|java\.lang\.OutOfMemoryError|Java heap space|GC overhead", re.I),
+              re.compile(r"is lower than Flutter's minimum supported version|minSdkVersion \d+ cannot be smaller|requires Android Gradle plugin", re.I),
           ]
           HINTS = [
+              (r"lower than Flutter's minimum supported version", "Versi Gradle/AGP/Kotlin/JDK project lebih rendah dari minimum Flutter. Workflow menaikkannya otomatis; bila masih gagal, versi baru tidak cocok dengan plugin lama -> kirim `flutterVersion` yang lebih lama."),
+              (r"minSdkVersion \d+ cannot be smaller than version", "Plugin butuh minSdk lebih tinggi dari app. Workflow menaikkan minSdk otomatis; periksa `minSdk` di android/app/build.gradle bila masih muncul."),
               (r"Namespace not specified", "Modul/plugin lama tidak punya `namespace` (wajib di AGP 8+). Workflow sudah mencoba mengisinya otomatis; kalau masih gagal, perbarui plugin yang disebut di log."),
               (r"Unsupported class file major version|invalid source release|requires Java \d+|Java version", "Versi JDK tidak cocok dengan Gradle/AGP/Kotlin project. Kirim `javaVersion` di payload (mis. 11/17/21) atau perbarui versi Gradle."),
               (r"Minimum supported Gradle version is|requires Gradle \d", "Versi Gradle wrapper terlalu rendah untuk AGP. Naikkan `distributionUrl` di gradle-wrapper.properties."),
@@ -1810,6 +2529,8 @@ jobs:
           LIST="$RUNNER_TEMP/sdk-list.txt"
           for i in 1 2 3; do sdk --list > "$LIST" 2>/dev/null && [ -s "$LIST" ] && break; sleep 3; done
 
+          MODE=scan
+          if [ "${1:-}" = install ]; then MODE=install; shift; WANT=("$@"); else
           mapfile -t WANT < <(python3 - <<'PY'
           import json, os
           tc = json.load(open(os.environ["GITHUB_WORKSPACE"] + "/_diag/toolchain.json"))
@@ -1821,6 +2542,7 @@ jobs:
           print("\n".join(dict.fromkeys(pk)))
           PY
           )
+          fi
 
           installed() { # installed <paket> : cek folder
             case "$1" in
@@ -1848,6 +2570,8 @@ jobs:
             done
           done
 
+          [ "$MODE" = install ] && exit 0
+
           # pastikan ada build-tools (untuk zipalign/apksigner)
           if ! ls "$SDK"/build-tools/*/apksigner >/dev/null 2>&1; then
             echo "build-tools belum ada -> memasang build-tools;35.0.0"
@@ -1856,7 +2580,7 @@ jobs:
 
           # NDK utama (untuk tool yang membaca ANDROID_NDK_HOME)
           NDKDIR=""
-          REQ="$(python3 -c "import json,os;print((json.load(open(os.environ['GITHUB_WORKSPACE']+'/_diag/toolchain.json')).get('ndk') or [''])[0])")"
+          REQ="$(python3 -c "import json,os;n=json.load(open(os.environ['GITHUB_WORKSPACE']+'/_diag/toolchain.json')).get('ndk') or [];print(max(n,key=lambda v:[int(x) for x in v.split('.') if x.isdigit()]) if n else '')")"
           if [ -n "$REQ" ] && [ -d "$SDK/ndk/$REQ" ]; then NDKDIR="$SDK/ndk/$REQ"
           elif ls -d "$SDK"/ndk/*/ >/dev/null 2>&1; then NDKDIR="$(ls -d "$SDK"/ndk/*/ | sort -V | tail -1)"; NDKDIR="${NDKDIR%/}"; fi
           {
@@ -1875,8 +2599,9 @@ jobs:
           ROOT="$GITHUB_WORKSPACE"; DIAG="$ROOT/_diag"; LOG="$DIAG/build.log"; OUT="$ROOT/out"; PRJ="$ROOT/project"
           mkdir -p "$DIAG" "$OUT"; : > "$LOG"
           TYPE="${BUILD_TYPE:-release}"; PERF="${PERF_MODE:-fast}"; ENGINE="${ENGINE:-native}"
-          tcget() { python3 -c "import json,sys;print(json.load(open('$DIAG/toolchain.json')).get(sys.argv[1]) or '')" "$1" 2>/dev/null; }
-          FLAVOR="$(tcget flavor)"; MODULE="$(tcget app_module)"; ALT="$(tcget flutter_alt)"
+          tcget() { python3 -c "import json,sys;v=json.load(open('$DIAG/toolchain.json')).get(sys.argv[1]);print(' '.join(map(str,v)) if isinstance(v,list) else (v or ''))" "$1" 2>/dev/null; }
+          FLAVOR="$(tcget flavor)"; MODULE="$(tcget app_module)"; ALTS="$(tcget flutter_alts)"; [ -n "$ALTS" ] || ALTS="$(tcget flutter_alt)"
+          export ENGINE
           CAP="$(printf '%s' "${TYPE:0:1}" | tr a-z A-Z)${TYPE:1}"
 
           summary() { [ -n "${GITHUB_STEP_SUMMARY:-}" ] && printf '%s\n' "$*" >> "$GITHUB_STEP_SUMMARY"; return 0; }
@@ -1914,48 +2639,105 @@ jobs:
             rm -rf "$HOME/.gradle/daemon" 2>/dev/null || true
           }
 
+          # ── Perbaikan otomatis (JDK • Gradle • AGP • Kotlin • SDK • NDK • Flutter) ───────
+          . "$RUNNER_TEMP/ci/flutter.sh"
+          HEAL_ENV="$RUNNER_TEMP/heal.sh"; EXTRA_FLAGS=(); NEXT_FLUTTER=""
+
+          use_java() { # use_java <versi>  — pindah ke JDK yang sudah terpasang di runner (JAVA_HOME_<n>_X64)
+            local n="$1" var h cur
+            var="JAVA_HOME_${n}_X64"; h="${!var:-}"
+            cur="$(java -version 2>&1 | sed -n 's/.*version "\([0-9]*\).*/\1/p' | head -1)"
+            [ "$cur" = "$n" ] && return 0
+            if [ -z "$h" ] || [ ! -x "$h/bin/java" ]; then echo "::warning::JDK $n tidak tersedia di runner (tetap memakai JDK ${cur:-?})."; return 1; fi
+            export JAVA_HOME="$h" PATH="$h/bin:$PATH"
+            echo "JAVA_HOME=$h" >> "$GITHUB_ENV"
+            [ "$ENGINE" = flutter ] && flutter config --jdk-dir "$h" >/dev/null 2>&1 || true
+            cleanup_state
+            echo "✔ JDK dialihkan ke $n ($h)" | tee -a "$LOG"
+          }
+
+          heal_apply() { # heal_apply <attempt.log> : 0 bila ada perbaikan BARU yang diterapkan
+            rm -f "$HEAL_ENV"
+            python3 "$RUNNER_TEMP/ci/compat.py" heal "$1" 2>&1 | tee -a "$LOG"
+            [ "${PIPESTATUS[0]}" -eq 0 ] || return 1
+            HEAL_JAVA=""; HEAL_SDK=""; HEAL_FLUTTER=""; HEAL_FLAGS=""
+            # shellcheck disable=SC1090
+            [ -f "$HEAL_ENV" ] && . "$HEAL_ENV"
+            # shellcheck disable=SC2086
+            [ -n "$HEAL_SDK" ] && { bash "$RUNNER_TEMP/ci/sdk.sh" install $HEAL_SDK 2>&1 | tail -20 | tee -a "$LOG"; }
+            [ -n "$HEAL_JAVA" ] && use_java "$HEAL_JAVA"
+            local f; for f in $HEAL_FLAGS; do EXTRA_FLAGS+=("$f"); done
+            [ -n "$HEAL_FLUTTER" ] && NEXT_FLUTTER="$HEAL_FLUTTER"
+            return 0
+          }
+
           # ── Flutter ────────────────────────────────────────────────────────────────
           flutter_build() { # flutter_build <label> <v|n>
             local a=(build apk "--$TYPE" --no-pub)
             if [ "$PERF" = low ]; then a+=(--target-platform android-arm,android-arm64); else a+=(--target-platform android-arm64 --no-tree-shake-icons); fi
             [ -n "$FLAVOR" ] && a+=(--flavor "$FLAVOR")
+            [ "${#EXTRA_FLAGS[@]}" -gt 0 ] && a+=("${EXTRA_FLAGS[@]}")
             [ "$2" = v ] && a+=(-v)
             (cd "$PRJ" && run "$1" flutter "${a[@]}")
           }
 
-          install_alt_flutter() { # install_alt_flutter <versi>
-            local v="$1" d="$HOME/flutter-alt-$1"
-            echo "::group::Pasang Flutter alternatif $v"
-            if [ ! -x "$d/bin/flutter" ]; then
-              mkdir -p "$RUNNER_TEMP/fl" && rm -rf "$RUNNER_TEMP/fl/flutter"
-              curl -fL --retry 3 "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${v}-stable.tar.xz" \
-                | tar -xJ -C "$RUNNER_TEMP/fl" || { echo "::endgroup::"; return 1; }
-              mv "$RUNNER_TEMP/fl/flutter" "$d"
-            fi
-            export FLUTTER_ROOT="$d" PATH="$d/bin:$PATH"
-            git config --global --add safe.directory "$d" 2>/dev/null || true
-            flutter --version 2>&1 | head -3
-            local lp="$PRJ/android/local.properties"
-            [ -f "$lp" ] && sed -i "s#^flutter.sdk=.*#flutter.sdk=$d#" "$lp"
-            echo "::endgroup::"
+          after_flutter_switch() { # setelah SDK Flutter diganti: pindai ulang plugin, syarat minimum, tambalan, komponen SDK, JDK
+            (cd "$PRJ" && python3 "$RUNNER_TEMP/ci/detect.py" plugins) 2>&1 | tee -a "$LOG" || true
+            python3 "$RUNNER_TEMP/ci/compat.py" reqs 2>&1 | tee -a "$LOG" || true
+            python3 "$RUNNER_TEMP/ci/prepare.py" 2>&1 | tail -5 | tee -a "$LOG" || true
+            python3 "$RUNNER_TEMP/ci/compat.py" patch 2>&1 | tee -a "$LOG" || true
+            bash "$RUNNER_TEMP/ci/sdk.sh" 2>&1 | tail -12 | tee -a "$LOG" || true
+            local j; j="$(tcget java)"; [ -n "$j" ] && { use_java "$j" || true; }
+            return 0
+          }
+
+          # build_with_heal: 0 = sukses | 1 = gagal | 2 = perbaikan meminta Flutter lain (NEXT_FLUTTER)
+          build_with_heal() {
+            local round=0 maxr=6 plain=0 mark v
+            while :; do
+              mark=$(wc -l < "$LOG")
+              v=n; [ "$round" -ge $((maxr - 1)) ] && v=v
+              if flutter_build "flutter build apk ($TYPE, $PERF) #$((round + 1))" "$v"; then return 0; fi
+              tail -n +$((mark + 1)) "$LOG" > "$DIAG/attempt.log"
+              [ "$round" -ge $((maxr - 1)) ] && return 1
+              cleanup_state
+              NEXT_FLUTTER=""
+              if heal_apply "$DIAG/attempt.log"; then
+                [ -n "$NEXT_FLUTTER" ] && return 2
+              elif grep -qE '\.dart:[0-9]+:[0-9]+: Error' "$DIAG/attempt.log"; then
+                return 1   # error kode Dart: mengulang tidak membantu; coba SDK Flutter lain
+              elif [ "$plain" -eq 0 ]; then
+                plain=1
+                echo "::warning::Tidak ada pola error yang dikenali. Mengulang sekali dengan state bersih + log verbose."
+                (cd "$PRJ" && flutter clean >/dev/null 2>&1; run "flutter pub get (ulang)" flutter pub get) || true
+                round=$((maxr - 2))
+              else
+                return 1
+              fi
+              round=$((round + 1))
+            done
           }
 
           build_flutter() {
-            if flutter_build "flutter build apk ($TYPE, $PERF)" n; then return 0; fi
-            echo "::warning::Build gagal. Mengulang dengan state bersih + log verbose."
-            cleanup_state
-            (cd "$PRJ" && flutter clean >/dev/null 2>&1; run "flutter pub get (ulang)" flutter pub get) || true
-            if flutter_build "flutter build apk (ulang, verbose)" v; then return 0; fi
-            if [ -n "$ALT" ]; then
-              echo "::warning::Mencoba Flutter alternatif $ALT (seangkatan constraint SDK project)."
-              cleanup_state
-              if install_alt_flutter "$ALT"; then
-                (cd "$PRJ" && flutter clean >/dev/null 2>&1; run "flutter pub get (SDK $ALT)" flutter pub get) || true
-                if flutter_build "flutter build apk (Flutter $ALT)" v; then return 0; fi
-              else
-                echo "::warning::Flutter $ALT tidak bisa diunduh."
+            local queue=("") tried target rc a
+            tried=" $(flutter_ver_now) "
+            for a in $ALTS; do queue+=("$a"); done
+            while [ "${#queue[@]}" -gt 0 ]; do
+              target="${queue[0]}"; queue=("${queue[@]:1}")
+              if [ -n "$target" ]; then
+                case "$tried" in *" $target "*) continue ;; esac
+                echo "::warning::Mencoba Flutter alternatif $target (kandidat berikutnya sesuai pubspec & dependency)."
+                cleanup_state
+                if ! install_flutter "$target"; then echo "::warning::Flutter $target tidak bisa diunduh."; continue; fi
+                tried+="$target "
+                (cd "$PRJ" && flutter clean >/dev/null 2>&1) || true
+                if ! (cd "$PRJ" && run "flutter pub get (SDK $target)" flutter pub get); then continue; fi
+                after_flutter_switch
               fi
-            fi
+              build_with_heal; rc=$?
+              [ "$rc" -eq 0 ] && return 0
+              if [ "$rc" -eq 2 ] && [ -n "$NEXT_FLUTTER" ]; then queue=("$NEXT_FLUTTER" "${queue[@]}"); NEXT_FLUTTER=""; fi
+            done
             return 1
           }
 
@@ -1966,12 +2748,20 @@ jobs:
             if [ -f ./gradlew ]; then chmod +x ./gradlew; else GR=gradle; echo "::notice::gradlew tidak ada -> memakai gradle $(gradle --version 2>/dev/null | sed -n 3p)"; fi
             local task="assemble$CAP"
             [ -n "$MODULE" ] && task=":${MODULE//\//:}:$task"
-            local base=(--no-daemon --stacktrace --warning-mode=summary)
-            if run "gradle $task" $GR "${base[@]}" "$task"; then return 0; fi
-            echo "::warning::Gradle gagal. Mengulang dengan state bersih, refresh dependency, dan --info."
-            cleanup_state
-            if run "gradle $task (ulang, --info)" $GR "${base[@]}" --refresh-dependencies --info "$task"; then return 0; fi
-            return 1
+            local base=(--no-daemon --stacktrace --warning-mode=summary) round=0 refresh=0 mark opts
+            while :; do
+              opts=("${base[@]}"); [ "$refresh" -eq 1 ] && opts+=(--refresh-dependencies --info)
+              mark=$(wc -l < "$LOG")
+              if run "gradle $task (#$((round + 1)))" $GR "${opts[@]}" "$task"; then return 0; fi
+              tail -n +$((mark + 1)) "$LOG" > "$DIAG/attempt.log"
+              { [ "$refresh" -eq 1 ] || [ "$round" -ge 5 ]; } && return 1
+              cleanup_state
+              if ! heal_apply "$DIAG/attempt.log"; then
+                echo "::warning::Gradle gagal. Mengulang dengan state bersih, refresh dependency, dan --info."
+                refresh=1
+              fi
+              round=$((round + 1))
+            done
           }
 
           # ── pilih & tanda tangan APK ───────────────────────────────────────────────
@@ -2088,6 +2878,65 @@ jobs:
           [ -n "$LAST" ] && tail -n 400 "$LAST" > "$D/gradle-daemon-tail.log" 2>/dev/null
           echo "Diagnostik terkumpul: $(find "$D" -type f | wc -l) file ($(du -sh "$D" | cut -f1))"
           __CI_EOF__
+          cat > "$RUNNER_TEMP/ci/flutter.sh" <<'__CI_EOF__'
+          #!/usr/bin/env bash
+          # flutter.sh - fungsi bantu (di-source): pasang/ganti SDK Flutter eksak + `flutter pub get` dengan fallback versi
+          # Dipakai oleh langkah 5c (siapkan project) dan build.sh (ulang dengan Flutter alternatif).
+          CI_DIR="${RUNNER_TEMP:-/tmp}/ci"
+
+          flutter_ver_now() {
+            flutter --version 2>/dev/null | sed -n 's/^Flutter \([0-9][0-9.]*\).*/\1/p' | head -1
+          }
+
+          # install_flutter <versi> [persist]  — unduh arsip resmi, aktifkan di shell ini; 'persist' = berlaku juga untuk langkah workflow berikutnya
+          install_flutter() {
+            local v="$1" d="$HOME/flutter-alt-$1" tmp="${RUNNER_TEMP:-/tmp}/fl"
+            echo "::group::Pasang Flutter $v"
+            if [ ! -x "$d/bin/flutter" ]; then
+              mkdir -p "$tmp" && rm -rf "$tmp/flutter"
+              if ! curl -fL --retry 3 "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${v}-stable.tar.xz" | tar -xJ -C "$tmp"; then
+                echo "::endgroup::"; return 1
+              fi
+              rm -rf "$d"; mv "$tmp/flutter" "$d"
+            fi
+            export FLUTTER_ROOT="$d" PATH="$d/bin:$PATH"
+            git config --global --add safe.directory "$d" 2>/dev/null || true
+            flutter config --no-analytics >/dev/null 2>&1 || true
+            flutter --version 2>&1 | head -3
+            local lp="${PRJ:-$GITHUB_WORKSPACE/project}/android/local.properties"
+            [ -f "$lp" ] && sed -i "s#^flutter.sdk=.*#flutter.sdk=$d#" "$lp"
+            if [ "${2:-}" = persist ]; then
+              echo "FLUTTER_ROOT=$d" >> "$GITHUB_ENV"
+              echo "$d/bin" >> "$GITHUB_PATH"
+            fi
+            echo "::endgroup::"
+            return 0
+          }
+
+          # pub_get_with_fallback <log> — `flutter pub get`; gagal karena constraint SDK -> pindah ke Flutter yang cocok (pesan pub / kandidat toolchain)
+          pub_get_with_fallback() {
+            local LOGF="$1" tried=" " cur round i rc nxt att="${RUNNER_TEMP:-/tmp}/pub-attempt.log"
+            cur="$(flutter_ver_now)"; tried+="$cur "
+            for round in 1 2 3 4; do
+              for i in 1 2 3; do
+                echo "::group::flutter pub get (Flutter ${cur:-?}, percobaan $i)"
+                flutter pub get 2>&1 | tee "$att" | tee -a "$LOGF"
+                rc=${PIPESTATUS[0]}
+                echo "::endgroup::"
+                [ "$rc" -eq 0 ] && return 0
+                # hanya ulangi kalau penyebabnya jaringan; konflik versi tidak akan hilang dengan mengulang
+                grep -qiE "SocketException|Connection (reset|closed|refused)|timed out|HandshakeException|Failed host lookup|Could not (resolve|connect)" "$att" || break
+                sleep $((i * 5))
+              done
+              nxt="$(python3 "$CI_DIR/compat.py" next-flutter "$att" $tried 2>/dev/null | tail -1)"
+              if [ -z "$nxt" ]; then return 1; fi
+              echo "::warning::flutter pub get gagal di Flutter ${cur:-?}; mencoba Flutter $nxt"
+              install_flutter "$nxt" persist || return 1
+              tried+="$nxt "; cur="$nxt"
+            done
+            return 1
+          }
+          __CI_EOF__
           chmod +x "$RUNNER_TEMP"/ci/*.sh
           # kosongkan ruang disk di latar belakang (tidak menyentuh Android SDK / JDK)
           (sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}/CodeQL" >/dev/null 2>&1 &) || true
@@ -2164,12 +3013,10 @@ jobs:
             flutter create --platforms=android --project-name "${NAME:-app}" --org com.example . 2>&1 | tee -a "$LOG" || true
             echo "::endgroup::"
           fi
+          . "$RUNNER_TEMP/ci/flutter.sh"
           ok=0
-          for i in 1 2 3; do
-            echo "::group::flutter pub get (percobaan $i)"
-            if flutter pub get 2>&1 | tee -a "$LOG"; then ok=1; echo "::endgroup::"; break; fi
-            echo "::endgroup::"; sleep $((i * 5))
-          done
+          # pub get gagal karena constraint SDK -> otomatis pindah ke Flutter yang cocok (pesan pub / kandidat dari analisis dependency)
+          if pub_get_with_fallback "$LOG"; then ok=1; fi
           if [ "$ok" != 1 ]; then
             python3 "$RUNNER_TEMP/ci/errsum.py" "$LOG"
             echo "::error title=flutter pub get gagal::Dependency tidak bisa diselesaikan. Lihat ringkasan di atas."
@@ -2195,6 +3042,8 @@ jobs:
             echo "::endgroup::"
           fi
           python3 "$RUNNER_TEMP/ci/detect.py" plugins
+          # syarat minimum Gradle/AGP/Kotlin/JDK dari Flutter SDK yang terpasang (JDK dinaikkan bila perlu)
+          python3 "$RUNNER_TEMP/ci/compat.py" reqs || true
 
       # ── JDK & Gradle ─────────────────────────────────────────────────────
       - name: "6a · Pasang JDK ${{ steps.plug.outputs.java || steps.tc.outputs.java }} (Temurin)"
@@ -2237,7 +3086,10 @@ jobs:
 
       - name: "9 · Tambal project agar bisa dibuild di runner"
         shell: bash
-        run: python3 "$RUNNER_TEMP/ci/prepare.py"
+        run: |
+          python3 "$RUNNER_TEMP/ci/prepare.py"
+          # selaraskan Gradle wrapper / AGP / Kotlin / minSdk plugin / NDK dengan syarat Flutter & dependency
+          python3 "$RUNNER_TEMP/ci/compat.py" patch || true
 
       # ── Build ────────────────────────────────────────────────────────────
       - name: "10 · Build APK (${{ env.ENGINE }} • ${{ env.BUILD_TYPE }} • ${{ env.PERF_MODE }})"
