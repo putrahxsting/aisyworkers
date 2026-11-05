@@ -720,7 +720,10 @@ jobs:
               if engine == "native":
                   # root project native bisa berada di PROJECT langsung
                   wrapper = os.path.join(PROJECT, "gradlew")
-              has_wrapper = os.path.exists(wrapper)
+              # wrapper dianggap ada HANYA bila gradlew DAN gradle/wrapper/gradle-wrapper.jar lengkap
+              # (jar hilang -> "Could not find or load main class org.gradle.wrapper.GradleWrapperMain")
+              has_wrapper = os.path.exists(wrapper) and os.path.exists(
+                  os.path.join(os.path.dirname(wrapper), "gradle", "wrapper", "gradle-wrapper.jar"))
               gradle_wrap = vmax(acc["gradle_wrap"])
               agp = vmax(acc["agp"])
               gradle_for_java = gradle_wrap or (gradle_for_agp(agp) if agp else "")
@@ -2718,7 +2721,52 @@ jobs:
             done
           }
 
+          # ── Gradle wrapper otomatis (Flutter android/ & Android native) ────────────────
+          # Bila gradlew / gradle-wrapper.jar / gradle-wrapper.properties tidak ada -> dibuat otomatis (seperti w2a_fix_wrapper di web2apk).
+          ensure_wrapper() { # ensure_wrapper <gradleRoot>
+            local root="$1" props jar ver="" url tmp gbin zipf
+            [ -d "$root" ] || return 0
+            props="$root/gradle/wrapper/gradle-wrapper.properties"; jar="$root/gradle/wrapper/gradle-wrapper.jar"
+            sed -i 's/\r$//' "$props" 2>/dev/null || true
+            if [ -f "$root/gradlew" ] && [ -s "$jar" ] && unzip -tqq "$jar" >/dev/null 2>&1; then
+              sed -i 's/\r$//' "$root/gradlew"; chmod +x "$root/gradlew"; return 0
+            fi
+            echo "::warning::gradlew / gradle-wrapper.jar tidak lengkap di $root -> dibuat otomatis"
+            ver="$(sed -nE 's/.*gradle-([0-9][0-9.]*)-(bin|all)\.zip.*/\1/p' "$props" 2>/dev/null | head -1)"
+            [ -z "$ver" ] && ver="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("gradle") or "")' "$DIAG/toolchain.json" 2>/dev/null || true)"
+            [ -z "$ver" ] && ver="8.10.2"
+            tmp="$(mktemp -d)"
+            gbin="$(command -v gradle || true)"
+            if [ -z "$gbin" ]; then
+              echo "gradle tidak ada di PATH -> mengunduh gradle-$ver"
+              zipf="$tmp/g.zip"
+              if curl -fsSL --retry 3 -o "$zipf" "https://services.gradle.org/distributions/gradle-$ver-bin.zip" && unzip -q -o "$zipf" -d "$tmp/dist"; then
+                gbin="$(ls -d "$tmp"/dist/gradle-*/bin/gradle 2>/dev/null | head -1)"
+              fi
+            fi
+            if [ -n "$gbin" ]; then
+              mkdir -p "$tmp/w" && ( cd "$tmp/w" && "$gbin" wrapper --gradle-version "$ver" --distribution-type bin --no-daemon --console=plain >/dev/null 2>&1 ) || true
+            fi
+            if [ -s "$tmp/w/gradle/wrapper/gradle-wrapper.jar" ]; then
+              mkdir -p "$root/gradle/wrapper"
+              cp "$tmp/w/gradle/wrapper/gradle-wrapper.jar" "$jar"
+              [ -f "$root/gradlew" ] || cp "$tmp/w/gradlew" "$root/gradlew"
+              [ -f "$root/gradlew.bat" ] || cp "$tmp/w/gradlew.bat" "$root/gradlew.bat" 2>/dev/null || true
+              if [ ! -f "$props" ]; then
+                printf '%s\n' "distributionBase=GRADLE_USER_HOME" "distributionPath=wrapper/dists" \
+                  "distributionUrl=https\\://services.gradle.org/distributions/gradle-$ver-bin.zip" \
+                  "networkTimeout=180000" "zipStoreBase=GRADLE_USER_HOME" "zipStorePath=wrapper/dists" > "$props"
+              fi
+              sed -i 's/\r$//' "$root/gradlew"; chmod +x "$root/gradlew"
+              echo "::notice::gradle-wrapper.jar dibuat ulang (gradle $ver) di $root"
+            else
+              echo "::warning::Gagal membuat gradle-wrapper.jar otomatis; build memakai gradle sistem bila bisa."
+            fi
+            rm -rf "$tmp"
+          }
+
           build_flutter() {
+            ensure_wrapper "$PRJ/android"
             local queue=("") tried target rc a
             tried=" $(flutter_ver_now) "
             for a in $ALTS; do queue+=("$a"); done
@@ -2745,7 +2793,8 @@ jobs:
           build_native() {
             cd "$PRJ" || return 1
             local GR=./gradlew
-            if [ -f ./gradlew ]; then chmod +x ./gradlew; else GR=gradle; echo "::notice::gradlew tidak ada -> memakai gradle $(gradle --version 2>/dev/null | sed -n 3p)"; fi
+            ensure_wrapper "$PRJ"
+            [ -f ./gradlew ] && [ -s ./gradle/wrapper/gradle-wrapper.jar ] || { GR=gradle; echo "::notice::memakai gradle sistem"; }
             local task="assemble$CAP"
             [ -n "$MODULE" ] && task=":${MODULE//\//:}:$task"
             local base=(--no-daemon --stacktrace --warning-mode=summary) round=0 refresh=0 mark opts
@@ -3064,7 +3113,7 @@ jobs:
       - name: "6c · Gradle (cache + versi bila project tanpa wrapper)"
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: ${{ steps.tc.outputs.has_wrapper == 'false' && env.ENGINE == 'native' && steps.tc.outputs.gradle || '' }}
+          gradle-version: ${{ steps.tc.outputs.has_wrapper == 'false' && steps.tc.outputs.gradle || '' }}
           cache-read-only: false
 
       # ── Android SDK / NDK ────────────────────────────────────────────────
