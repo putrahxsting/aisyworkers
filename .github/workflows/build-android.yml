@@ -1058,6 +1058,62 @@ jobs:
               note("~/.gradle/gradle.properties + init script namespace dipasang")
 
 
+          def missing_resources_fix():
+              """Manifest merujuk @mipmap/xxx (mis. activity-alias ic_theme_*) yang file-nya tidak ikut di ZIP
+              -> AAPT 'resource mipmap/xxx not found'. Buat pengganti dari ic_launcher (atau vektor polos)."""
+              import shutil
+              made = 0
+              for root, dirs, files in os.walk(gradle_root):
+                  dirs[:] = [d for d in dirs if d not in ("build", ".gradle", ".git", "node_modules", "intermediates")]
+                  if "AndroidManifest.xml" not in files or not root.replace("\\", "/").endswith("src/main"):
+                      continue
+                  res = os.path.join(root, "res")
+                  txt = read(os.path.join(root, "AndroidManifest.xml")) or ""
+                  refs = set(re.findall(r"@mipmap/([A-Za-z0-9_]+)", txt))
+                  icon_refs = set(re.findall(r'android:(?:icon|roundIcon|logo)\s*=\s*"@drawable/([A-Za-z0-9_]+)"', txt))
+                  if not refs and not icon_refs:
+                      continue
+                  have = {}
+                  if os.path.isdir(res):
+                      for d in os.listdir(res):
+                          p = os.path.join(res, d)
+                          if os.path.isdir(p) and (d.startswith("mipmap") or d.startswith("drawable")):
+                              for f in os.listdir(p):
+                                  have.setdefault((d.split("-")[0], os.path.splitext(f)[0]), []).append((d, f))
+                  def base_files():
+                      for cand in ("ic_launcher", "ic_launcher_round", "ic_launcher_foreground"):
+                          if have.get(("mipmap", cand)):
+                              return have[("mipmap", cand)]
+                      return []
+                  vec = ('<?xml version="1.0" encoding="utf-8"?>\n'
+                         '<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" '
+                         'android:viewportWidth="108" android:viewportHeight="108">\n'
+                         '  <path android:fillColor="#1E88E5" android:pathData="M0,0h108v108h-108z"/>\n'
+                         '  <path android:fillColor="#FFFFFF" android:pathData="M54,30a24,24 0 1,0 0.1,0z"/>\n</vector>\n')
+                  todo = [("mipmap", n) for n in sorted(refs)] + [("drawable", n) for n in sorted(icon_refs)]
+                  for kind, name in todo:
+                      if have.get((kind, name)) or have.get(("mipmap", name)) or have.get(("drawable", name)):
+                          continue
+                      # resource bisa juga didefinisikan di values/*.xml
+                      vals = os.path.join(res, "values")
+                      if os.path.isdir(vals) and any(re.search(r'name="%s"' % re.escape(name), read(os.path.join(vals, f)) or "") for f in os.listdir(vals)):
+                          continue
+                      src = base_files()
+                      if src:
+                          for d, f in src:
+                              ext = os.path.splitext(f)[1]
+                              os.makedirs(os.path.join(res, d), exist_ok=True)
+                              shutil.copyfile(os.path.join(res, d, f), os.path.join(res, d, name + ext))
+                      else:
+                          d = "mipmap-anydpi-v26" if kind == "mipmap" else "drawable"
+                          os.makedirs(os.path.join(res, d), exist_ok=True)
+                          write(os.path.join(res, d, name + ".xml"), vec)
+                      made += 1
+                      note(f"resource @{kind}/{name} dirujuk manifest tapi tidak ada -> dibuat pengganti ({'salinan ic_launcher' if src else 'ikon vektor polos'})")
+              if made:
+                  print(f"::warning::[prepare] {made} resource ikon yang hilang dibuat otomatis (aman; ikon alias akan sama dengan ikon utama)")
+
+
           if __name__ == "__main__":
               if not os.path.isdir(gradle_root):
                   print("::notice::[prepare] folder gradle belum ada (menunggu flutter create)")
@@ -1069,6 +1125,7 @@ jobs:
                   local_properties()
                   key_properties()
                   namespace_fix()
+                  missing_resources_fix()
               user_gradle()
               print(f"[prepare] selesai: {len(fixes)} perbaikan")
           __CI_EOF__
